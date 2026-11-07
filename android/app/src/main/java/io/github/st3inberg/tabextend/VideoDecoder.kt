@@ -2,6 +2,7 @@ package io.github.st3inberg.tabextend
 
 import android.media.MediaCodec
 import android.media.MediaCodecInfo.CodecCapabilities
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
@@ -18,7 +19,7 @@ import android.view.Surface
  * frames arrive unevenly.
  */
 class VideoDecoder(width: Int, height: Int, surface: Surface) {
-    private val codec = MediaCodec.createDecoderByType(MIME)
+    private val codec = createDecoder()
     private val info = MediaCodec.BufferInfo()
     val lowLatency: Boolean
     val name: String = codec.name
@@ -46,6 +47,10 @@ class VideoDecoder(width: Int, height: Int, surface: Surface) {
             // it without advertising the feature, and others ignore it.
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
+            // Some vendors size the output delay when the codec is configured,
+            // so their switches must be in the format: set later through
+            // setParameters, Qualcomm's decoder still holds back 10-12 frames.
+            configureKeys(codec.name).forEach { setInteger(it, 1) }
         }
         codec.configure(format, surface, null, 0)
         vendorLowLatency = enableVendorLowLatency()
@@ -127,10 +132,51 @@ class VideoDecoder(width: Int, height: Int, surface: Surface) {
     }
 
     private companion object {
+        /**
+         * Prefer a hardware decoder that advertises low latency. Qualcomm ships
+         * it as a separate component (c2.qti.avc.decoder.low_latency) that
+         * createDecoderByType never picks, so the default one buffers frames.
+         */
+        fun createDecoder(): MediaCodec {
+            val lowLatencyName = runCatching {
+                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+                    !info.isEncoder && info.isHardwareAccelerated &&
+                        info.supportedTypes.any { it.equals(MIME, ignoreCase = true) } &&
+                        info.getCapabilitiesForType(MIME).isFeatureSupported(CodecCapabilities.FEATURE_LowLatency)
+                }?.name
+            }.getOrNull()
+            if (lowLatencyName != null) {
+                runCatching { MediaCodec.createByCodecName(lowLatencyName) }
+                    .onSuccess { Log.i(TAG, "using low-latency decoder $lowLatencyName"); return it }
+                    .onFailure { Log.w(TAG, "could not open $lowLatencyName", it) }
+            }
+            return MediaCodec.createDecoderByType(MIME)
+        }
+
         const val MIME = MediaFormat.MIMETYPE_VIDEO_AVC
         const val INPUT_TIMEOUT_US = 20_000L
         const val OUTPUT_TIMEOUT_US = 10_000L
         const val MAX_TRACKED = 256
         const val TAG = "TabExtendDecoder"
+    }
+}
+
+/**
+ * Vendor low-latency keys to put in the format before configure, by decoder
+ * name. Qualcomm needs picture-order output as well as its low-latency switch,
+ * or it reorders and buffers frames; Exynos has its own switch. Same keys as
+ * Moonlight uses. Decoders ignore keys they do not know.
+ */
+internal fun configureKeys(decoderName: String): List<String> {
+    val name = decoderName.lowercase()
+    return when {
+        name.startsWith("c2.qti.") || name.startsWith("omx.qcom.") -> listOf(
+            "vendor.qti-ext-dec-picture-order.enable",
+            "vendor.qti-ext-dec-low-latency.enable",
+        )
+        name.startsWith("c2.exynos.") || name.startsWith("omx.exynos.") -> listOf(
+            "vendor.rtc-ext-dec-low-latency.enable",
+        )
+        else -> emptyList()
     }
 }
