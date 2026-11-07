@@ -26,6 +26,8 @@ use tabextend_core::input::{InputCall, ScrollAxis};
 
 use crate::audio::SoundSource;
 use crate::input_eis::EisInput;
+use crate::pipeline::{CURSOR_SOURCE_NAME, CursorPosition};
+use crate::pointer::{self, PointerWatch};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -53,6 +55,11 @@ pub trait Capture: Send + Sync {
     fn inject(&self, call: InputCall) -> BoxFuture<'_, Result<(), String>>;
     /// Release the surface (for a virtual monitor: remove it from GNOME).
     fn stop(self: Box<Self>) -> BoxFuture<'static, ()>;
+    /// The pointer on the stream, from somewhere better than the stream's
+    /// own metadata, if this capture has such a source.
+    fn pointer(&self) -> Option<tokio::sync::watch::Receiver<CursorPosition>> {
+        None
+    }
 }
 
 /// A moving test pattern, no desktop needed. Input is recorded, not applied.
@@ -215,13 +222,18 @@ impl PortalVirtualMonitor {
         cast.select_sources(
             &session,
             SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::Embedded)
+                // GNOME does not draw the pointer into a virtual monitor's
+                // picture (seen on GNOME 50): take it as metadata, and the
+                // tablet draws it.
+                .set_cursor_mode(CursorMode::Metadata)
                 .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Virtual))
                 .set_multiple(false),
         )
         .await
         .and_then(|r| r.response())
         .map_err(at("select a virtual monitor"))?;
+        // The connectors before the virtual monitor exists, to find it after.
+        let connectors_before = pointer::connectors().await;
         let selected = remote
             .start(&session, None, StartOptions::default())
             .await
@@ -278,6 +290,7 @@ impl PortalVirtualMonitor {
             height,
             logical,
             eis,
+            pointer: PointerWatch::start(connectors_before, (width, height)).await,
         })
     }
 
@@ -322,6 +335,7 @@ struct PortalCapture {
     height: u32,
     logical: (f64, f64),
     eis: Option<EisInput>,
+    pointer: Option<PointerWatch>,
 }
 
 /// A device name made safe to embed in a pipeline description or a sound
@@ -360,7 +374,7 @@ impl Capture for PortalCapture {
             // what it gives and fit it into the stream with black bars. The
             // input mapper knows where the bars are.
             return format!(
-                "pipewiresrc fd={} path={} always-copy=true keepalive-time=500 \
+                "pipewiresrc name={CURSOR_SOURCE_NAME} fd={} path={} always-copy=true keepalive-time=500 \
                  ! videoconvert ! videoscale add-borders=true \
                  ! video/x-raw,width={},height={},pixel-aspect-ratio=1/1",
                 self.fd.as_raw_fd(),
@@ -375,7 +389,7 @@ impl Capture for PortalCapture {
             ("", " always-copy=true")
         };
         format!(
-            "pipewiresrc fd={} path={}{copy} keepalive-time=500 \
+            "pipewiresrc name={CURSOR_SOURCE_NAME} fd={} path={}{copy} keepalive-time=500 \
              ! video/x-raw{memory},width={},height={}",
             self.fd.as_raw_fd(),
             self.node,
@@ -386,6 +400,10 @@ impl Capture for PortalCapture {
 
     fn input_size(&self) -> (f64, f64) {
         self.logical
+    }
+
+    fn pointer(&self) -> Option<tokio::sync::watch::Receiver<CursorPosition>> {
+        self.pointer.as_ref().map(PointerWatch::positions)
     }
 
     /// A sound output that appears in GNOME's Sound settings while the

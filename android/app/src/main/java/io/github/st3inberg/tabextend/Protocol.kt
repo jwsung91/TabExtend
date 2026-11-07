@@ -17,7 +17,8 @@ import java.nio.charset.StandardCharsets
  * before anything is allocated.
  */
 object Protocol {
-    const val VERSION = 1
+    /** 2: adds [Message.Cursor]. Host and tablet must speak the same version. */
+    const val VERSION = 2
     const val MAX_VIDEO_FRAME = 16 * 1024 * 1024
     const val MAX_CONTROL_MESSAGE = 4096
     const val MAX_AUDIO_CHUNK = 64 * 1024
@@ -43,12 +44,13 @@ object Protocol {
     private const val SCROLL = 13
     private const val KEY = 14
     private const val AUDIO = 15
+    private const val CURSOR = 16
 
     fun maxLength(tag: Int): Int = when (tag) {
         VIDEO -> 1 + MAX_VIDEO_FRAME + 9
         AUDIO -> 1 + 8 + MAX_AUDIO_CHUNK
         HELLO, WELCOME, REJECT, PING, PONG, REQUEST_KEYFRAME, PAIR_CHALLENGE, PAIR_REVEAL,
-        TOUCH, POINTER_MOVE, BUTTON, SCROLL, KEY -> MAX_CONTROL_MESSAGE
+        TOUCH, POINTER_MOVE, BUTTON, SCROLL, KEY, CURSOR -> MAX_CONTROL_MESSAGE
         else -> throw ProtocolException("unknown message tag $tag")
     }
 
@@ -146,6 +148,12 @@ object Protocol {
                 body.u16(message.code)
                 body.u8(if (message.pressed) 1 else 0)
             }
+            is Message.Cursor -> {
+                body.u8(CURSOR)
+                body.u8(if (message.visible) 1 else 0)
+                body.f32(message.x)
+                body.f32(message.y)
+            }
         }
         val bytes = body.toByteArray()
         return ByteBuffer.allocate(HEADER_LEN + bytes.size).putInt(bytes.size).put(bytes).array()
@@ -226,6 +234,7 @@ object Protocol {
             SCROLL -> Message.Scroll(r.u16().toShort().toInt(), r.u16().toShort().toInt())
             KEY -> Message.Key(r.u16(), r.flag())
             AUDIO -> Message.Audio(r.u64(), r.rest())
+            CURSOR -> Message.Cursor(r.flag(), r.f32(), r.f32())
             else -> throw ProtocolException("unknown message tag $tag")
         }
         if (r.remaining() != 0) throw ProtocolException("message has trailing bytes")
@@ -369,4 +378,11 @@ sealed class Message {
 
     /** A chunk of the laptop's sound, in the format described at [Protocol.AUDIO_RATE]. */
     class Audio(val ptsUs: Long, val pcm: ByteArray) : Message()
+
+    /**
+     * Where the laptop's pointer is on the stream, as a fraction of its width
+     * and height, or [visible] false when it is not on this monitor. GNOME
+     * does not draw it into the picture, so the tablet draws it.
+     */
+    data class Cursor(val visible: Boolean, val x: Float, val y: Float) : Message()
 }

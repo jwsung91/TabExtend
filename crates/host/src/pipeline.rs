@@ -5,11 +5,56 @@ use std::sync::{Arc, Mutex};
 
 use gst::prelude::*;
 use gstreamer as gst;
+use gstreamer_video as gst_video;
 use tabextend_core::encoder::EncoderSpec;
 use tabextend_core::h264::low_delay_access_unit;
 
 /// Element name the encoder gets inside the pipeline.
 const ENCODER_NAME: &str = "encoder";
+
+/// Element name of a PipeWire source whose frames carry the pointer as
+/// metadata instead of in the picture. Captures that name their source this
+/// get the pointer reported through `on_cursor`.
+pub const CURSOR_SOURCE_NAME: &str = "capturesrc";
+
+/// The pointer on the stream, as a fraction of its width and height, or
+/// None when it is not on this monitor or hidden.
+pub type CursorPosition = Option<(f32, f32)>;
+
+/// Where pointer positions go, and the stream size they are relative to.
+pub struct CursorSink {
+    pub stream_size: (u32, u32),
+    pub report: Box<dyn Fn(CursorPosition) + Send + Sync>,
+}
+
+/// Where a point of the captured picture lands in the stream, as a fraction
+/// of the stream: the picture is scaled to fit and centred, with bars on two
+/// sides if the shapes differ (as `videoscale add-borders=true` does).
+pub fn cursor_on_stream(
+    (x, y): (i32, i32),
+    (source_w, source_h): (u32, u32),
+    (stream_w, stream_h): (u32, u32),
+) -> CursorPosition {
+    if source_w == 0 || source_h == 0 || stream_w == 0 || stream_h == 0 {
+        return None;
+    }
+    if x < 0 || y < 0 || x as u32 >= source_w || y as u32 >= source_h {
+        return None;
+    }
+    let (sw, sh, tw, th) = (
+        f64::from(source_w),
+        f64::from(source_h),
+        f64::from(stream_w),
+        f64::from(stream_h),
+    );
+    let scale = (tw / sw).min(th / sh);
+    let left = (tw - sw * scale) / 2.0;
+    let top = (th - sh * scale) / 2.0;
+    Some((
+        ((left + f64::from(x) * scale) / tw) as f32,
+        ((top + f64::from(y) * scale) / th) as f32,
+    ))
+}
 
 /// The first of the spec's converters whose elements are all installed.
 pub fn converter_for(spec: &EncoderSpec) -> &str {
@@ -90,6 +135,7 @@ impl EncodePipeline {
         spec: &EncoderSpec,
         config: &StreamConfig,
         attach: impl FnOnce(&gst::Bin) -> Result<(), String>,
+        cursor: CursorSink,
         on_frame: impl Fn(EncodedFrame) + Send + Sync + 'static,
         on_error: impl Fn(String) + Send + Sync + 'static,
     ) -> Result<Self, String> {
@@ -129,6 +175,14 @@ impl EncodePipeline {
                 captured.fetch_add(1, Ordering::Relaxed);
                 gst::PadProbeReturn::Ok
             });
+        }
+
+        if let Some(pad) = pipeline
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.by_name(CURSOR_SOURCE_NAME))
+            .and_then(|source| source.static_pad("src"))
+        {
+            add_cursor_probe(&pad, cursor);
         }
 
         // appsink through its signals, so no gstreamer-app development
@@ -201,6 +255,47 @@ impl EncodePipeline {
     }
 }
 
+/// Report the pointer from each captured buffer's metadata, and drop the
+/// buffers that carry only a pointer move. With the pointer as metadata,
+/// GNOME sends such a buffer whenever the pointer moves over a still screen;
+/// it has no picture (PipeWire skips its empty chunk), so it must not reach
+/// the encoder. A buffer without pointer metadata means the pointer is not
+/// on this monitor: GNOME clears it then.
+fn add_cursor_probe(pad: &gst::Pad, cursor: CursorSink) {
+    let CursorSink {
+        stream_size,
+        report,
+    } = cursor;
+    let last: Mutex<Option<CursorPosition>> = Mutex::new(None);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let source_size = pad
+            .current_caps()
+            .and_then(|caps| gst_video::VideoInfo::from_caps(&caps).ok())
+            .map(|info| (info.width(), info.height()));
+        let position = buffer
+            .iter_meta::<gst_video::VideoRegionOfInterestMeta>()
+            .find(|meta| meta.roi_type() == "cursor")
+            .and_then(|meta| {
+                let (x, y, _, _) = meta.rect();
+                cursor_on_stream((x as i32, y as i32), source_size?, stream_size)
+            });
+        if let Ok(mut last) = last.lock()
+            && *last != Some(position)
+        {
+            *last = Some(position);
+            report(position);
+        }
+        if buffer.n_memory() == 0 {
+            gst::PadProbeReturn::Drop
+        } else {
+            gst::PadProbeReturn::Ok
+        }
+    });
+}
+
 /// Start a pipeline. On failure, say why (the reason is on the bus, the
 /// state change error says nothing) and shut it down cleanly: a pipeline
 /// dropped outside the NULL state leaks and makes GStreamer complain.
@@ -226,5 +321,44 @@ pub(crate) fn play(pipeline: &gst::Element, what: &str) -> Result<(), String> {
 impl Drop for EncodePipeline {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_on_stream;
+
+    #[test]
+    fn same_size_is_a_plain_fraction() {
+        assert_eq!(
+            cursor_on_stream((960, 300), (1920, 1200), (1920, 1200)),
+            Some((0.5, 0.25))
+        );
+    }
+
+    #[test]
+    fn scaled_down_keeps_the_fraction() {
+        assert_eq!(
+            cursor_on_stream((1280, 800), (2560, 1600), (1920, 1200)),
+            Some((0.5, 0.5))
+        );
+    }
+
+    #[test]
+    fn bars_shift_the_position() {
+        // 1920×1080 fitted into 1920×1200: 60 px bars above and below.
+        let (x, y) = cursor_on_stream((0, 0), (1920, 1080), (1920, 1200)).unwrap();
+        assert_eq!(x, 0.0);
+        assert!((y - 60.0 / 1200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn off_the_picture_is_hidden() {
+        assert_eq!(cursor_on_stream((-1, 10), (1920, 1200), (1920, 1200)), None);
+        assert_eq!(
+            cursor_on_stream((1920, 10), (1920, 1200), (1920, 1200)),
+            None
+        );
+        assert_eq!(cursor_on_stream((10, 10), (0, 0), (1920, 1200)), None);
     }
 }

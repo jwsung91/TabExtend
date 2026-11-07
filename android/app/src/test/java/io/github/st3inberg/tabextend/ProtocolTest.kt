@@ -25,6 +25,13 @@ class ProtocolTest {
     }
 
     @Test
+    fun cursorMatchesTheRustWireFormat() {
+        // Same vector as `known_bytes_for_cursor` in crates/core/src/protocol.rs.
+        val expected = byteArrayOf(0, 0, 0, 10, 16, 1, 0x3f, 0, 0, 0, 0x3f, 0x80.toByte(), 0, 0)
+        assertArrayEquals(expected, Protocol.encode(Message.Cursor(true, 0.5f, 1.0f)))
+    }
+
+    @Test
     fun controlMessagesRoundTrip() {
         for (message in listOf(
             Message.Welcome(1, 1280, 800),
@@ -32,6 +39,8 @@ class ProtocolTest {
             Message.Ping(4_000_000_000, Long.MAX_VALUE),
             Message.Pong(9, 123),
             Message.RequestKeyframe,
+            Message.Cursor(true, 0.5f, 0.25f),
+            Message.Cursor(false, 0f, 0f),
         )) {
             assertEquals(message, roundTrip(message))
         }

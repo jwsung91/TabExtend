@@ -56,6 +56,8 @@ class StreamSession(
         fun onPaired(host: Host)
         fun onConfirmCode(code: String, computer: String)
         fun onStats(fps: Double, mbps: Double, decodeMs: Double)
+        /** The laptop's pointer moved, appeared or left; called on the network thread. */
+        fun onCursor(visible: Boolean, x: Float, y: Float)
         fun onGaveUp(reason: String)
     }
 
@@ -213,6 +215,7 @@ class StreamSession(
                     }
                 }
                 is Message.Audio -> audio?.write(message.pcm)
+                is Message.Cursor -> listener.onCursor(message.visible, message.x, message.y)
                 is Message.Ping -> outbox.offer(Message.Pong(message.id, message.sentUs))
                 is Message.Reject -> throw IOException(message.detail)
                 else -> {}

@@ -27,7 +27,7 @@ use tabextend_core::protocol::{
 use tabextend_core::stream::{FrameDecision, FrameGate, default_bitrate, stream_size};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::approve::Approver;
@@ -35,7 +35,9 @@ use crate::audio::AudioPipeline;
 use crate::capture::{Capture, CaptureBackend};
 use crate::events::{Events, ServerEvent, StreamStats, print_events};
 use crate::identity::{HostIdentity, PairedStore, fingerprint};
-use crate::pipeline::{EncodePipeline, EncodedFrame, StreamConfig, accepts_gpu_buffers};
+use crate::pipeline::{
+    CursorPosition, CursorSink, EncodePipeline, EncodedFrame, StreamConfig, accepts_gpu_buffers,
+};
 use crate::tls;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -558,6 +560,23 @@ where
     let (error_tx, mut errors) = mpsc::unbounded_channel::<String>();
     let gate = Arc::new(Mutex::new(FrameGate::new()));
     let stats = Arc::new(Mutex::new(Stats::default()));
+    // Only the latest pointer position matters: a watch keeps just that.
+    let (cursor_tx, mut cursor) = watch::channel::<CursorPosition>(None);
+    let cursor_tx = Arc::new(cursor_tx);
+    // A better pointer source than the stream's metadata, if the capture has
+    // one: then the stream's is ignored.
+    let pointer_task = capture.pointer().map(|mut positions| {
+        let cursor_tx = cursor_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                cursor_tx.send_replace(*positions.borrow_and_update());
+                if positions.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+    let pointer_from_stream = pointer_task.is_none();
 
     let start = |gpu_buffers: bool| {
         let gate = gate.clone();
@@ -565,11 +584,20 @@ where
         let frame_tx = frame_tx.clone();
         let keyframe_tx = keyframe_tx.clone();
         let error_tx = error_tx.clone();
+        let cursor_tx = cursor_tx.clone();
         EncodePipeline::start(
             &capture.source(gpu_buffers),
             encoder,
             &config,
             |pipeline| capture.attach(pipeline),
+            CursorSink {
+                stream_size: (width, height),
+                report: Box::new(move |position| {
+                    if pointer_from_stream {
+                        cursor_tx.send_replace(position);
+                    }
+                }),
+            },
             move |frame| {
                 let room = frame_tx.capacity() > 0;
                 let decision = gate.lock().expect("gate").decide(frame.keyframe, room);
@@ -663,6 +691,15 @@ where
                 s.bytes += len as u64;
                 sent_total += 1;
             }
+            Ok(()) = cursor.changed() => {
+                let message = match *cursor.borrow_and_update() {
+                    Some((x, y)) => Message::Cursor { visible: true, x, y },
+                    None => Message::Cursor { visible: false, x: 0.0, y: 0.0 },
+                };
+                if let Err(e) = write(writer, &message).await {
+                    break Err(e);
+                }
+            }
             Some((pts_us, pcm)) = audio.recv() => {
                 if let Err(e) = write(writer, &Message::Audio { pts_us, pcm }).await {
                     break Err(e);
@@ -750,6 +787,9 @@ where
         }
     };
     reader_task.abort();
+    if let Some(task) = pointer_task {
+        task.abort();
+    }
     *audio_pipeline.lock().expect("audio slot") = AudioSlot::Stopped;
     // Nothing may stay pressed on the laptop after the tablet is gone.
     for call in input.release_all() {

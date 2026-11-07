@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback, StreamSession.
     private lateinit var hosts: HostStore
     private lateinit var settings: AppSettings
     private lateinit var surfaceView: SurfaceView
+    private lateinit var cursor: CursorOverlay
     private lateinit var stats: TextView
     private lateinit var screens: ComposeView
     private lateinit var discovery: Discovery
@@ -98,6 +99,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback, StreamSession.
             setOnTouchListener { _, event -> forward(input.onTouch(event)) }
             setOnGenericMotionListener { _, event -> forward(input.onGenericMotion(event)) }
         }
+        cursor = CursorOverlay(this)
         stats = TextView(this).apply {
             setTextColor(Color.argb(200, 255, 255, 255))
             setBackgroundColor(Color.argb(120, 0, 0, 0))
@@ -111,6 +113,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback, StreamSession.
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(surfaceView, FrameLayout.LayoutParams(-1, -1))
+            addView(cursor, FrameLayout.LayoutParams(-1, -1))
             addView(stats, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
             addView(screens, FrameLayout.LayoutParams(-1, -1))
         })
@@ -122,6 +125,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback, StreamSession.
         val streaming = screen == Screen.Streaming
         screens.visibility = if (streaming) View.GONE else View.VISIBLE
         stats.visibility = if (streaming && state.showStats) View.VISIBLE else View.GONE
+        cursor.visibility = if (streaming) View.VISIBLE else View.GONE
+        if (!streaming) cursor.hide()
         window.insetsController?.let {
             if (streaming) {
                 it.hide(WindowInsets.Type.systemBars())
@@ -400,6 +405,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback, StreamSession.
     override fun onStats(fps: Double, mbps: Double, decodeMs: Double) = runOnUiThread {
         stats.text = getString(R.string.stats, fps, mbps, decodeMs)
     }
+
+    override fun onCursor(visible: Boolean, x: Float, y: Float) = cursor.update(visible, x, y)
 
     override fun onGaveUp(reason: String) = runOnUiThread {
         pendingTarget = null

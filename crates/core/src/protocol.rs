@@ -13,7 +13,8 @@
 
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 2: adds `Cursor`, the laptop's pointer drawn by the tablet.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest video frame accepted, in bytes. A 2560×1600 keyframe at a high
 /// bitrate is around 1 MiB.
@@ -180,6 +181,15 @@ pub enum Message {
         pts_us: u64,
         pcm: Vec<u8>,
     },
+    /// Host → client: where the laptop's pointer is on the stream, as a
+    /// fraction of its width and height, or that it is not on this monitor
+    /// (or hidden, as GNOME does while touch is in use). The desktop does
+    /// not draw the pointer into the picture; the tablet draws it.
+    Cursor {
+        visible: bool,
+        x: f32,
+        y: f32,
+    },
 }
 
 mod tag {
@@ -198,6 +208,7 @@ mod tag {
     pub const SCROLL: u8 = 13;
     pub const KEY: u8 = 14;
     pub const AUDIO: u8 = 15;
+    pub const CURSOR: u8 = 16;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,7 +269,8 @@ pub fn max_length(tag: u8) -> Result<usize, ProtocolError> {
         | tag::POINTER_MOVE
         | tag::BUTTON
         | tag::SCROLL
-        | tag::KEY => Ok(MAX_CONTROL_MESSAGE),
+        | tag::KEY
+        | tag::CURSOR => Ok(MAX_CONTROL_MESSAGE),
         other => Err(ProtocolError::UnknownTag(other)),
     }
 }
@@ -386,6 +398,12 @@ impl Message {
                 body.u8(tag::AUDIO);
                 body.u64(*pts_us);
                 body.bytes(pcm);
+            }
+            Message::Cursor { visible, x, y } => {
+                body.u8(tag::CURSOR);
+                body.u8(u8::from(*visible));
+                body.f32(*x);
+                body.f32(*y);
             }
         }
         let body = body.0;
@@ -526,6 +544,11 @@ impl Message {
                 code: r.u16()?,
                 pressed: r.bool("key state")?,
             }),
+            tag::CURSOR => Message::Cursor {
+                visible: r.bool("cursor visibility")?,
+                x: r.f32()?,
+                y: r.f32()?,
+            },
             other => return Err(ProtocolError::UnknownTag(other)),
         };
         if !r.0.is_empty() {
@@ -715,7 +738,32 @@ mod tests {
                 pts_us: 7,
                 pcm: vec![1, 2, 3, 4],
             },
+            Message::Cursor {
+                visible: true,
+                x: 0.5,
+                y: 0.25,
+            },
+            Message::Cursor {
+                visible: false,
+                x: 0.0,
+                y: 0.0,
+            },
         ]
+    }
+
+    #[test]
+    fn known_bytes_for_cursor() {
+        // Pins the wire format the Kotlin client also implements.
+        let encoded = Message::Cursor {
+            visible: true,
+            x: 0.5,
+            y: 1.0,
+        }
+        .encode();
+        assert_eq!(
+            encoded,
+            [0, 0, 0, 10, 16, 1, 0x3f, 0, 0, 0, 0x3f, 0x80, 0, 0]
+        );
     }
 
     #[test]

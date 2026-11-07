@@ -1,0 +1,7 @@
+{
+  "uuid": "tabextend-pointer@jwsung91.github.io",
+  "name": "TabExtend pointer",
+  "description": "Tells TabExtend where the pointer is, so the tablet can draw it. GNOME does not send pointer moves for virtual monitors to screen casts (seen on GNOME 50).",
+  "shell-version": ["48", "49", "50"],
+  "url": "https://github.com/jwsung91/TabExtend"
+}

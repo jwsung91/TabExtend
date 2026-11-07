@@ -9,6 +9,7 @@ pub mod identity;
 pub mod input_eis;
 pub mod mdns;
 pub mod pipeline;
+pub mod pointer;
 pub mod portals;
 pub mod probe;
 pub mod runner;
